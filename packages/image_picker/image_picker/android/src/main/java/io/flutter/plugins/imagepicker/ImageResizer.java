@@ -6,7 +6,13 @@ package io.flutter.plugins.imagepicker;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.AnimatedImageDrawable;
+import android.graphics.ImageDecoder;
+import android.graphics.ImageDecoder.Source;
+import android.graphics.Movie;
 import android.util.Log;
+import android.os.Build;
 import androidx.annotation.Nullable;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -19,7 +25,7 @@ import java.util.Set;
 class ImageResizer {
   /** Extensions that the ImageResizer cannot resize. */
   private static final Set<String> nonResizeableExtensions =
-      new HashSet<>(Arrays.asList("gif", "svg", "apng"));
+      new HashSet<>(Arrays.asList("svg", "apng"));
 
   private final File externalFilesDirectory;
   private final ExifDataCopier exifDataCopier;
@@ -50,6 +56,14 @@ class ImageResizer {
     boolean canScale = !nonResizeableExtensions.contains(extension);
     if (!canScale) {
       return imagePath;
+    }
+    // This doesn't resize animated GIFs or WEBPs yet...
+    try {
+      if (isAnimatedFile(imagePath)) {
+        return imagePath;
+      }
+    } catch (IOException e) {
+      throw new RuntimeException(e);
     }
     Bitmap bmp = decodeFile(imagePath);
     if (bmp == null) {
@@ -135,6 +149,21 @@ class ImageResizer {
 
   private Bitmap decodeFile(String path) {
     return BitmapFactory.decodeFile(path);
+  }
+
+  private boolean isAnimatedFile(String path) throws IOException {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+      // If the encoded image is an animated GIF or WEBP, decodeDrawable will
+      // return an AnimatedImageDrawable.
+      // https://developer.android.com/reference/android/graphics/ImageDecoder
+      File file = new File(path);
+      ImageDecoder.Source source = ImageDecoder.createSource(file);
+      Drawable drawable = ImageDecoder.decodeDrawable(source);
+      return drawable instanceof AnimatedImageDrawable;
+    } else {
+      // Fallback to Movie
+      return Movie.decodeFile(path) != null;
+    }
   }
 
   private Bitmap createScaledBitmap(Bitmap bmp, int width, int height, boolean filter) {
