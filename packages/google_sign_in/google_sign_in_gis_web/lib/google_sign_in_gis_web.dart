@@ -16,18 +16,19 @@ import 'package:google_identity_services_web/oauth2.dart' as oauth;
 import 'package:google_sign_in_platform_interface/google_sign_in_platform_interface.dart';
 import 'package:js/js.dart' show allowInterop;
 
+import 'src/network.dart';
 import 'src/utils.dart';
 
 const String _kClientIdMetaSelector = 'meta[name=google-signin-client_id]';
 const String _kClientIdAttributeName = 'content';
 
 /// Implementation of the google_sign_in plugin for Web.
-class GoogleSignInPlugin extends GoogleSignInPlatform {
+class GoogleSignInGisWeb extends GoogleSignInPlatform {
   /// Constructs the plugin immediately and begins initializing it in the
   /// background.
   ///
   /// The plugin is completely initialized when [initialized] completed.
-  GoogleSignInPlugin() {
+  GoogleSignInGisWeb() {
     _autoDetectedClientId = html
         .querySelector(_kClientIdMetaSelector)
         ?.getAttribute(_kClientIdAttributeName);
@@ -38,6 +39,8 @@ class GoogleSignInPlugin extends GoogleSignInPlatform {
   late Future<void> _isGisLoaded;
 
   bool _isInitCalled = false;
+
+  late List<String> _requestedScopes;
 
   // A client used to authorize/revoke scopes.
   late oauth.TokenClient _tokenClient;
@@ -77,7 +80,7 @@ class GoogleSignInPlugin extends GoogleSignInPlatform {
 
   /// Factory method that initializes the plugin with [GoogleSignInPlatform].
   static void registerWith(Registrar registrar) {
-    GoogleSignInPlatform.instance = GoogleSignInPlugin();
+    GoogleSignInPlatform.instance = GoogleSignInGisWeb();
   }
 
   @override
@@ -109,33 +112,43 @@ class GoogleSignInPlugin extends GoogleSignInPlatform {
 
     assertValidScopes(params.scopes);
 
+    // We store the scopes so we can add "userinfo.email" and "userinfo.profile"
+    // later, if needed to synthesize a [GoogleSignInUserData] object from a
+    // request to the people API.
+    _requestedScopes = params.scopes;
+
     await _isGisLoaded;
 
     // Init the identity provider...
     id.initialize(id.IdConfiguration(
       client_id: appClientId!,
-      callback: _credentialResponse.add,
+      callback: allowInterop(_credentialResponse.add),
       auto_select: true,
     ));
 
     // Init the Token client...
     _tokenClient = oauth.initTokenClient(oauth.TokenClientConfig(
       hosted_domain: params.hostedDomain,
-      scope: params.scopes.join(' '),
+      scope: <String>[
+        ..._requestedScopes,
+        ...peopleApiScopes,
+      ].join(','),
       client_id: appClientId,
-      callback: _tokenResponse.add,
+      callback: allowInterop(_tokenResponse.add),
     ));
 
     // Remember the last responses the stream has seen...
     _credentialResponse.stream.listen((id.CredentialResponse response) {
       _lastCredentialResponse = response;
     }).onError((Object? error) {
+      print(error);
       _lastCredentialResponse = null;
     }); // Never fail?
 
     _tokenResponse.stream.listen((oauth.TokenResponse response) {
       _lastTokenResponse = response;
     }).onError((Object? error) {
+      print(error);
       _lastTokenResponse = null;
     }); // Never fail?
 
@@ -143,11 +156,22 @@ class GoogleSignInPlugin extends GoogleSignInPlatform {
     _isInitCalled = true;
   }
 
-  // Maybe attempt to .prompt() here?
+  /// Calls [id.prompt] to attempt to re-authenticate a returning user.
   @override
   Future<GoogleSignInUserData?> signInSilently() async {
     await initialized;
-
+    // Attempt to prompt, we'll return the next entry on the
+    // onUserData stream, coming from our identity callback.
+    // This might throw a PlatformException.
+    id.prompt(allowInterop(_onPromptNotification));
+    try {
+      // Await for the next credentialResponse (the "first" of a new subscription)
+      // then convert it to a GoogleSignInUserData when ready...
+      return _credentialResponse.stream.first.then(gisCredentialToPluginUserData);
+    } on PlatformException catch (e) {
+      // The card didn't work for some reason, see [_onPromptNotification].
+      print(e);
+    }
     return null;
   }
 
@@ -174,22 +198,30 @@ class GoogleSignInPlugin extends GoogleSignInPlatform {
     }
   }
 
+  /// Attempt to sign-in and authorize using the oauth2 implicit flow.
+  ///
+  /// This uses the TokenClient, that might trigger a pop-up authentication flow,
+  /// however the plugin will not give us the GoogleSignInUserData.
+  ///
+  /// If at that point, we still don't have any user data, we'll synthesize it by
+  /// making a request to the "profile.readonly" API and attempting to read it
+  /// from there.
   @override
   Future<GoogleSignInUserData?> signIn() async {
     await initialized;
-    // Attempt to prompt, we'll return the next entry on the
-    // onUserData stream, coming from our identity callback.
-    // This might throw a PlatformException.
-    id.prompt(allowInterop(_onPromptNotification));
-    // Await for the next credentialResponse (the "first" of a new subscription)
-    final id.CredentialResponse response =
-        await _credentialResponse.stream.first;
+
     _tokenClient.requestAccessToken(oauth.OverridableTokenClientConfig(
-      hint: gisCredentialGetHint(response),
+      hint: gisCredentialGetHint(_lastCredentialResponse),
     ));
-    await _tokenResponse.stream.first;
+
+    if (_lastCredentialResponse == null) {
+      return _tokenResponse.stream.first.then(
+        (oauth.TokenResponse token) => getUserDataFromPeopleApi(token.access_token)
+      );
+    } else {
+      return gisCredentialToPluginUserData(_lastCredentialResponse);
+    }
     // The access_token will be available through `getTokens`.
-    return gisCredentialToPluginUserData(response);
   }
 
   @override
